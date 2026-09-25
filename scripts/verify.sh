@@ -25,9 +25,11 @@ $PY -m unittest discover -v -s tests -p 'test_*.py'
 
 echo "--- [3/3] lifecycle proof + HTTP smoke ---"
 # Without LEDGER_BASE_URL this runs local subprocess scenarios for torn-tail
-# recovery, corruption isolation and HTTP concurrent preemption.
+# recovery (batches and seal frames), corruption isolation, HTTP
+# concurrent preemption and seal/prefix-proof verification with an
+# independent root fold.
 # With LEDGER_BASE_URL (compose verify service) it additionally performs an
-# HTTP smoke against the running ledger container.
+# HTTP smoke (batch + seal + proof) against the running ledger container.
 $PY tests/e2e_smoke.py
 
 if [ -n "${LEDGER_BASE_URL:-}" ]; then

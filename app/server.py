@@ -7,6 +7,17 @@ POST /api/batches
     201 committed batch / 409 optimistic-concurrency loser (nothing written)
     / 400 malformed / 503 ledger poisoned.
 
+POST /api/seals
+    Body: ``{"expected_seq": <next seq the caller saw>}``. Freezes the
+    prefix of all records before that seq (canonical Merkle root, count,
+    seal id); answers only after the seal frame is durable. 409 stale,
+    400 malformed/empty prefix, 503 poisoned.
+
+GET /api/seals/<seal_id>/proof?seq=<n>
+    200 leaf value, leaf digest, leaf-to-root sibling path and per-step
+    directions that independently fold back to the sealed root. 404 for
+    unknown seal/out-of-prefix seq, 400 malformed, 503 poisoned.
+
 GET /api/records?cursor=<seq>&limit=<n>
     Returns records with serial numbers strictly greater than ``cursor``,
     oldest first, plus ``next_cursor`` for the following page. 503 when
@@ -25,7 +36,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-from .ledger import Ledger, MAX_LIMIT, StaleSequence
+from .ledger import (
+    EmptyPrefix,
+    Ledger,
+    MAX_LIMIT,
+    RecordOutsideSeal,
+    StaleSequence,
+    UnknownSeal,
+)
 from .wal import PoisonedError, WAL
 
 MAX_BODY_BYTES = 256 * 1024
@@ -87,20 +105,39 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_health()
         elif parts.path == "/api/records":
             self._handle_records(parts.query)
+        elif self._is_proof_path(parts.path):
+            self._handle_proof(parts.path, parts.query)
         elif parts.path == "/":
             self._send_json(
                 200,
                 {"service": "dose-ledger", "endpoints": [
-                    "POST /api/batches", "GET /api/records", "GET /healthz"]},
+                    "POST /api/batches", "GET /api/records",
+                    "POST /api/seals",
+                    "GET /api/seals/<seal_id>/proof?seq=<n>",
+                    "GET /healthz"]},
             )
         else:
             self._send_json(404, {"error": "not_found"})
 
+    @staticmethod
+    def _is_proof_path(path: str) -> bool:
+        prefix = "/api/seals/"
+        return (
+            path.startswith(prefix)
+            and path.endswith("/proof")
+            and len(path) > len(prefix) + len("/proof")
+        )
+
     def do_POST(self) -> None:  # noqa: N802
         parts = urlsplit(self.path)
-        if parts.path != "/api/batches":
+        if parts.path == "/api/batches":
+            self._handle_submit_batch()
+        elif parts.path == "/api/seals":
+            self._handle_create_seal()
+        else:
             self._send_json(404, {"error": "not_found"})
-            return
+
+    def _handle_submit_batch(self) -> None:
         body, err = self._read_json_body()
         if err is not None:
             self._send_json(400, {"error": "bad_request", "detail": err})
@@ -153,6 +190,110 @@ class Handler(BaseHTTPRequestHandler):
              "seq": frame.seq,
              "count": len(frame.records),
              "next_seq": frame.seq + len(frame.records)},
+        )
+
+    def _handle_create_seal(self) -> None:
+        body, err = self._read_json_body()
+        if err is not None:
+            self._send_json(400, {"error": "bad_request", "detail": err})
+            return
+        assert body is not None
+        expected = body.get("expected_seq")
+        if (
+            isinstance(expected, bool)
+            or not isinstance(expected, int)
+            or expected < 1
+        ):
+            self._send_json(
+                400,
+                {"error": "bad_request",
+                 "detail": "expected_seq must be a positive integer"},
+            )
+            return
+        ledger: Ledger = self.server.ledger  # type: ignore[attr-defined]
+        try:
+            seal = ledger.seal(expected)
+        except StaleSequence as exc:
+            self._send_json(
+                409,
+                {"error": "stale_sequence",
+                 "detail": str(exc),
+                 "current_seq": ledger.head()},
+            )
+            return
+        except EmptyPrefix as exc:
+            self._send_json(
+                400, {"error": "empty_prefix", "detail": str(exc)}
+            )
+            return
+        except ValueError as exc:
+            self._send_json(
+                400, {"error": "bad_request", "detail": str(exc)}
+            )
+            return
+        except PoisonedError as exc:
+            self._send_json(
+                503, {"error": "ledger_poisoned", "detail": str(exc)}
+            )
+            return
+        # 201 only after the whole seal frame is durable (ledger.seal blocks
+        # on WAL fsync before returning).
+        self._send_json(
+            201,
+            {"status": "sealed",
+             "seal_id": seal.seal_id,
+             "count": seal.count,
+             "next_seq": seal.next_seq,
+             "root": seal.root},
+        )
+
+    def _handle_proof(self, path: str, query: str) -> None:
+        # /api/seals/<seal_id>/proof — path segments are fixed by construction.
+        seal_id = path[len("/api/seals/"):-len("/proof")]
+        params = parse_qs(query)
+        raw_seq = params.get("seq", [None])[0]
+        try:
+            seq = int(raw_seq) if raw_seq is not None else None
+        except ValueError:
+            seq = None
+        ledger: Ledger = self.server.ledger  # type: ignore[attr-defined]
+        if seq is None or seq < 1:
+            self._send_json(
+                400,
+                {"error": "bad_request",
+                 "detail": "query parameter seq must be a positive integer"},
+            )
+            return
+        try:
+            proof = ledger.proof(seal_id, seq)
+        except UnknownSeal as exc:
+            self._send_json(404, {"error": "unknown_seal", "detail": str(exc)})
+            return
+        except RecordOutsideSeal as exc:
+            self._send_json(
+                404, {"error": "record_outside_seal", "detail": str(exc)}
+            )
+            return
+        except ValueError as exc:
+            self._send_json(
+                400, {"error": "bad_request", "detail": str(exc)}
+            )
+            return
+        except PoisonedError as exc:
+            self._send_json(
+                503, {"error": "ledger_poisoned", "detail": str(exc)}
+            )
+            return
+        self._send_json(
+            200,
+            {"seal_id": seal_id,
+             "seq": proof.seq,
+             "dose": proof.dose,
+             "count": proof.count,
+             "leaf": proof.leaf.hex(),
+             "path": [sibling.hex() for sibling in proof.path],
+             "direction": list(proof.direction),
+             "root": proof.root.hex()},
         )
 
     # -- handlers ---------------------------------------------------------

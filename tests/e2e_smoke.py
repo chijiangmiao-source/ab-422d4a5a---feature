@@ -12,7 +12,12 @@ It drives a *real* server subprocess through the full lifecycle:
   5. concurrent preemption over HTTP: N clients submit the same
      ``expected_seq``; exactly one gets 201, all others 409, and the WAL
      grows by exactly one frame -- no loser bytes, no consumed numbers
-  6. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
+  6. seal + membership proof: a prefix is sealed over HTTP, every leaf's
+     proof is independently folded back to the sealed root (including
+     across a restart), repeated queries are byte-identical, a torn seal
+     frame is truncated, and tampering with a sealed prefix yields 503
+     with no proofs served
+  7. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
 
 Exit status is non-zero if any constraint is violated, so a CI/compose
 "verify" service's exit code is the evidence.
@@ -20,6 +25,7 @@ Exit status is non-zero if any constraint is violated, so a CI/compose
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -38,9 +44,26 @@ from app.wal import (  # noqa: E402
     HEADER_LEN,
     canonical_payload,
     encode_frame,
+    seal_payload,
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def fold_proof(seq: int, dose: int, path: list, direction: list,
+               root: str) -> bool:
+    """Independent verifier: fold the JSON proof back up using only hashlib."""
+    current = hashlib.sha256(
+        b"\x00"
+        + json.dumps([seq, dose], separators=(",", ":")).encode("utf-8")
+    ).digest()
+    for sibling_hex, side in zip(path, direction):
+        sibling = bytes.fromhex(sibling_hex)
+        if side == "left":
+            current = hashlib.sha256(b"\x01" + current + sibling).digest()
+        else:
+            current = hashlib.sha256(b"\x01" + sibling + current).digest()
+    return current.hex() == root
 
 
 def request(method: str, url: str, body: object = None,
@@ -272,9 +295,134 @@ def main() -> int:
     finally:
         stop_server(proc)
 
+    section("6. seal prefix + independently verified membership proofs")
+    seal_path = os.path.join(tmp, "seal.bin")
+    proc, base = start_server(seal_path)
+    try:
+        # Batches are deliberately ragged sizes so the tree is non-full
+        # (10 leaves over 4 batches) and spans frames.
+        batches = [[101, 102, 103], [104], [105, 106, 107, 108], [109, 110]]
+        head = 1
+        for batch in batches:
+            status, body = request(
+                "POST", f"{base}/api/batches",
+                {"expected_seq": head, "records": batch})
+            assert status == 201, body
+            head += len(batch)
+        assert head == 11, head
+
+        # Stale observed seq: 409, no seal bytes, id not consumed.
+        size_before_seal = os.path.getsize(seal_path)
+        status, body = request(
+            "POST", f"{base}/api/seals", {"expected_seq": 1})
+        assert status == 409 and body["current_seq"] == 11, body
+        assert os.path.getsize(seal_path) == size_before_seal
+
+        status, seal = request(
+            "POST", f"{base}/api/seals", {"expected_seq": 11})
+        assert status == 201, seal
+        assert seal["seal_id"] == "s1", seal
+        assert seal["count"] == 10 and seal["next_seq"] == 11, seal
+        sealed_size = os.path.getsize(seal_path)
+        assert sealed_size > size_before_seal
+
+        proofs: dict[int, dict] = {}
+        for seq in range(1, 11):
+            status, proof = request(
+                "GET", f"{base}/api/seals/s1/proof?seq={seq}")
+            assert status == 200, proof
+            assert proof["seal_id"] == "s1" and proof["count"] == 10, proof
+            assert proof["seq"] == seq and proof["dose"] == 100 + seq, proof
+            assert fold_proof(
+                proof["seq"], proof["dose"], proof["path"],
+                proof["direction"], seal["root"]), proof
+            assert proof["root"] == seal["root"], proof
+            # Leaf must be the leaf-domain hash of the canonical record.
+            expect_leaf = hashlib.sha256(
+                b"\x00"
+                + json.dumps([seq, 100 + seq], separators=(",", ":")).encode()
+            ).hexdigest()
+            assert proof["leaf"] == expect_leaf, proof
+            proofs[seq] = proof
+
+        # Repeated queries: byte-identical proof.
+        status, again = request("GET", f"{base}/api/seals/s1/proof?seq=7")
+        assert status == 200 and again == proofs[7], (again, proofs[7])
+
+        # Unknown seal / seq outside the fixed prefix.
+        assert request("GET", f"{base}/api/seals/s9/proof?seq=1")[0] == 404
+        assert request("GET", f"{base}/api/seals/s1/proof?seq=11")[0] == 404
+        assert request("GET", f"{base}/api/seals/s1/proof?seq=x")[0] == 400
+
+        # Grow the ledger after sealing: the fixed prefix proof must not
+        # move, and a second seal over the longer prefix is its own root.
+        status, body = request(
+            "POST", f"{base}/api/batches",
+            {"expected_seq": 11, "records": [111, 112]})
+        assert status == 201, body
+        status, seal2 = request(
+            "POST", f"{base}/api/seals", {"expected_seq": 13})
+        assert status == 201 and seal2["seal_id"] == "s2", seal2
+        assert seal2["count"] == 12 and seal2["root"] != seal["root"]
+        status, later = request("GET", f"{base}/api/seals/s1/proof?seq=7")
+        assert later == proofs[7], (later, proofs[7])
+        status, p2 = request("GET", f"{base}/api/seals/s2/proof?seq=12")
+        assert status == 200 and fold_proof(
+            p2["seq"], p2["dose"], p2["path"], p2["direction"],
+            seal2["root"]), p2
+    finally:
+        stop_server(proc)
+
+    # Restart: WAL rebuild must re-verify every sealed prefix root; the
+    # exact same proofs must be served afterwards.
+    proc, base = start_server(seal_path)
+    try:
+        for seq in range(1, 11):
+            status, proof = request(
+                "GET", f"{base}/api/seals/s1/proof?seq={seq}")
+            assert status == 200 and proof == proofs[seq], (seq, proof)
+        print("10/10 proofs independently verified; stable across restart")
+    finally:
+        stop_server(proc)
+
+    # Torn seal frame at the physical tail: truncated on restart, prior
+    # seals survive and new appends keep continuous physical ordinals.
+    with open(seal_path, "ab") as fh:
+        fh.write(b"DSL1WAL\n" + b"\x00" * 5)  # partial seal header
+    torn_size = os.path.getsize(seal_path)
+    proc, base = start_server(seal_path)
+    try:
+        assert os.path.getsize(seal_path) < torn_size
+        status, body = request("GET", f"{base}/healthz")
+        assert status == 200 and body["next_seq"] == 13, body
+        status, proof = request("GET", f"{base}/api/seals/s1/proof?seq=1")
+        assert status == 200 and fold_proof(
+            proof["seq"], proof["dose"], proof["path"], proof["direction"],
+            proof["root"]), proof
+    finally:
+        stop_server(proc)
+
+    # Tamper with a complete batch that feeds a committed seal: recovery's
+    # prefix-root re-check (or digest check) must poison the whole service;
+    # no seal creation and no proof may be served.
+    data = bytearray(open(seal_path, "rb").read())
+    data[HEADER_LEN] ^= 0xFF  # first batch payload byte
+    with open(seal_path, "wb") as fh:
+        fh.write(data)
+    proc, base = start_server(seal_path, expect_status=503)
+    try:
+        assert request("GET", f"{base}/healthz")[0] == 503
+        assert request(
+            "POST", f"{base}/api/seals", {"expected_seq": 13})[0] == 503
+        status, body = request("GET", f"{base}/api/seals/s1/proof?seq=1")
+        assert status == 503 and body["error"] == "ledger_poisoned", body
+        print("tampered sealed prefix -> 503 on seal/proof/health only")
+    finally:
+        stop_server(proc)
+
     external = os.environ.get("LEDGER_BASE_URL")
     if external:
-        section(f"6. external smoke against {external}")
+        section(f"7. external smoke against {external}")
         body = wait_ready(external, expect_status=200)
         status, body = request("POST", f"{external}/api/batches", {
             "expected_seq": body["next_seq"],

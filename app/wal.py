@@ -37,7 +37,9 @@ import hashlib
 import json
 import os
 import threading
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
+
+from .merkle import merkle_root
 
 MAGIC = b"DSL1WAL\n"
 HEADER_LEN = 8 + 8 + 8
@@ -49,11 +51,25 @@ MAX_PAYLOAD_LEN = 64 * 1024 * 1024
 MIN_RECORDS = 1
 MAX_RECORDS = 32
 
+# Payload kinds. Batch payloads are JSON arrays of integers (the original
+# frame kind); seal payloads are JSON objects with a fixed key set.  The
+# first payload byte ([ vs {) already distinguishes them; parsing validates
+# the shape explicitly so object key order never matters.
+SEAL_KEYS = ("id", "count", "root")
+ROOT_HEX_LEN = 64
+
 
 class Frame(NamedTuple):
     frame_no: int  # 1-based batch ordinal
     seq: int  # serial number of the first record in the batch
     records: List[int]
+
+
+class SealFrame(NamedTuple):
+    frame_no: int  # 1-based ordinal of this physical frame
+    seal_id: str  # stable identifier, "s" + 1-based seal ordinal
+    count: int  # number of records fixed by this seal (prefix length)
+    root: str  # lowercase hex SHA-256 canonical Merkle root of the prefix
 
 
 class PoisonedError(RuntimeError):
@@ -67,12 +83,30 @@ class TruncatedTail(Exception):
 def canonical_payload(records: List[int]) -> bytes:
     """Canonical payload for a batch.
 
-    Compact, sorted-key, whitespace-free UTF-8 JSON.  The record list order
+    Compact, whitespace-free UTF-8 JSON.  The record list order
     supplied by the caller is preserved (it defines dose order within the
-    batch); only object key serialization is canonicalized.
+    batch); seal payloads are separate objects (see :func:`seal_payload`).
     """
     return json.dumps(
         records, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def seal_payload(seal_no: int, count: int, root: bytes) -> bytes:
+    """Canonical payload for a seal frame: a fixed-shape JSON object.
+
+    Keys are emitted in the pinned order in :data:`SEAL_KEYS`; recovery
+    parses JSON into a dict (so on-disk key order is never trusted) and
+    re-validates every field.  ``seal_no`` is derived from append position,
+    and ``id`` is ``"s" + str(seal_no)``.
+    """
+    obj = {
+        "id": f"s{seal_no}",
+        "count": count,
+        "root": root.hex(),
+    }
+    return json.dumps(
+        obj, separators=(",", ":"), ensure_ascii=False, sort_keys=False
     ).encode("utf-8")
 
 
@@ -87,6 +121,7 @@ def encode_frame(frame_no: int, payload: bytes) -> bytes:
 
 
 def decode_payload(payload: bytes) -> List[int]:
+    """Decode a batch payload (JSON array of 1-32 integers)."""
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -100,17 +135,76 @@ def decode_payload(payload: bytes) -> List[int]:
     return value
 
 
+def decode_seal_payload(payload: bytes) -> Tuple[str, int, str]:
+    """Decode/validate a seal payload, returning ``(id, count, root_hex)``.
+
+    Shape, key set, types and hex encoding are all re-checked; the seal id
+    is still cross-checked by the caller against frame append position.
+    """
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PoisonedError("seal payload is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise PoisonedError("seal payload is not a JSON object")
+    if tuple(sorted(value.keys())) != tuple(sorted(SEAL_KEYS)):
+        raise PoisonedError(
+            f"seal payload keys must be exactly {SEAL_KEYS!r}"
+        )
+    seal_id = value["id"]
+    count = value["count"]
+    root_hex = value["root"]
+    if (
+        not isinstance(seal_id, str)
+        or not seal_id.startswith("s")
+        or not seal_id[1:].isdigit()
+        or int(seal_id[1:]) < 1
+    ):
+        raise PoisonedError("seal payload has invalid id")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise PoisonedError("seal payload count must be a positive integer")
+    if not isinstance(root_hex, str) or len(root_hex) != ROOT_HEX_LEN:
+        raise PoisonedError("seal payload root must be 64 hex chars")
+    try:
+        bytes.fromhex(root_hex)
+    except ValueError:
+        raise PoisonedError("seal payload root is not valid hex")
+    if root_hex != root_hex.lower():
+        raise PoisonedError("seal payload root must be lowercase hex")
+    return seal_id, count, root_hex
+
+
 # ---------------------------------------------------------------------------
 # Recovery
 # ---------------------------------------------------------------------------
 
 class RecoveryResult(NamedTuple):
     frames: List[Frame]
-    truncated_bytes: int  # bytes removed from a torn tail
+    seals: List["SealFrame"]
+    truncated_bytes: int = 0  # bytes removed from a torn tail
 
 
-def _scan(data: bytes) -> List[Frame]:
+def _records_prefix(frames: List[Frame], count: int) -> List[int]:
+    """The first ``count`` records (by seq) across ``frames``."""
+    out: List[int] = []
+    for frame in frames:
+        take = min(len(frame.records), count - len(out))
+        if take > 0:
+            out.extend(frame.records[:take])
+        if len(out) == count:
+            break
+    return out
+
+
+def _scan(data: bytes) -> Tuple[List[Frame], List[SealFrame]]:
     """Parse all frames from ``data``; raise TruncatedTail on a torn tail.
+
+    Both batch frames and seal frames share one physical, monotonically
+    numbered append stream (the "same append order").  Every fully
+    persistent seal is re-verified here: the prefix it claims is
+    reconstructed solely from the batch frames physically before it and
+    its canonical Merkle root is recomputed; any mismatch poisons the
+    ledger so a tampered-but-"complete" seal can never serve a proof.
 
     A frame whose declared bounds run past EOF is ambiguous: it may be a
     genuinely torn tail (crashed append), or an earlier frame's length field
@@ -120,6 +214,7 @@ def _scan(data: bytes) -> List[Frame]:
     over-long frame the damage is mid-log and must poison the ledger.
     """
     frames: List[Frame] = []
+    seals: List[SealFrame] = []
     pos = 0
     size = len(data)
     while pos < size:
@@ -135,11 +230,11 @@ def _scan(data: bytes) -> List[Frame]:
             )
         frame_no = int.from_bytes(data[pos + 8 : pos + 16], "big")
         plen = int.from_bytes(data[pos + 16 : pos + 24], "big")
-        expected_no = len(frames) + 1
-        if frame_no != expected_no:
+        physical_no = len(frames) + len(seals) + 1
+        if frame_no != physical_no:
             raise PoisonedError(
                 f"frame ordinal gap/duplicate at offset {start}: "
-                f"got {frame_no}, expected {expected_no}"
+                f"got {frame_no}, expected {physical_no}"
             )
         if plen == 0 or plen > MAX_PAYLOAD_LEN:
             raise PoisonedError(
@@ -163,33 +258,72 @@ def _scan(data: bytes) -> List[Frame]:
             raise PoisonedError(
                 f"SHA-256 mismatch on complete frame at offset {start}"
             )
-        records = decode_payload(body[HEADER_LEN:])
-        if not (MIN_RECORDS <= len(records) <= MAX_RECORDS):
-            raise PoisonedError(
-                f"frame at offset {start} carries {len(records)} records"
+        payload = body[HEADER_LEN:]
+        kind_byte = payload[:1]
+        if kind_byte == b"[":
+            records = decode_payload(payload)
+            if not (MIN_RECORDS <= len(records) <= MAX_RECORDS):
+                raise PoisonedError(
+                    f"frame at offset {start} carries {len(records)} records"
+                )
+            seq = (
+                frames[-1].seq + len(frames[-1].records) if frames else 1
             )
-        seq = (
-            frames[-1].seq + len(frames[-1].records) if frames else 1
-        )
-        frames.append(
-            Frame(frame_no=frame_no, seq=seq, records=records)
-        )
+            frames.append(Frame(frame_no=frame_no, seq=seq, records=records))
+        elif kind_byte == b"{":
+            payload_id, count, root_hex = decode_seal_payload(payload)
+            seal_no = len(seals) + 1
+            expected_id = f"s{seal_no}"
+            if payload_id != expected_id:
+                raise PoisonedError(
+                    f"seal at offset {start} carries id {payload_id!r}, "
+                    f"expected {expected_id!r} from append position"
+                )
+            total_records = (
+                frames[-1].seq + len(frames[-1].records) - 1 if frames else 0
+            )
+            if count > total_records:
+                raise PoisonedError(
+                    f"seal {expected_id} at offset {start} fixes {count} "
+                    f"records but only {total_records} precede it in the log"
+                )
+            recomputed = merkle_root(_records_prefix(frames, count)).hex()
+            if recomputed != root_hex:
+                raise PoisonedError(
+                    f"sealed prefix root mismatch for {expected_id} at "
+                    f"offset {start}: payload claims {root_hex}, rebuilt "
+                    f"prefix root is {recomputed}"
+                )
+            seals.append(
+                SealFrame(
+                    frame_no=frame_no,
+                    seal_id=expected_id,
+                    count=count,
+                    root=root_hex,
+                )
+            )
+        else:
+            raise PoisonedError(
+                f"frame at offset {start} is neither a batch nor a seal "
+                f"payload"
+            )
         pos = frame_end
-    return frames
+    return frames, seals
 
 
 def recover(path: str) -> RecoveryResult:
     """Open/recover a WAL file.
 
     Truncates a torn tail in place (and fsyncs).  Raises PoisonedError for
-    any corruption that is not a single incomplete frame at EOF.
+    any corruption that is not a single incomplete frame at EOF, including
+    a complete seal frame whose rebuilt prefix root does not match.
     """
     if not os.path.exists(path):
-        return RecoveryResult(frames=[], truncated_bytes=0)
+        return RecoveryResult(frames=[], seals=[])
     with open(path, "rb") as fh:
         data = fh.read()
     try:
-        frames = _scan(data)
+        frames, seals = _scan(data)
     except TruncatedTail as torn:
         cut = torn.args[0]
         removed = len(data) - cut
@@ -199,9 +333,11 @@ def recover(path: str) -> RecoveryResult:
             fh.flush()
             os.fsync(fh.fileno())
         _fsync_dir(os.path.dirname(path) or ".")
-        frames = _scan(data[:cut])
-        return RecoveryResult(frames=frames, truncated_bytes=removed)
-    return RecoveryResult(frames=frames, truncated_bytes=0)
+        frames, seals = _scan(data[:cut])
+        return RecoveryResult(
+            frames=frames, seals=seals, truncated_bytes=removed
+        )
+    return RecoveryResult(frames=frames, seals=seals)
 
 
 def _fsync_dir(directory: str) -> None:
@@ -227,7 +363,12 @@ def _fsync_dir(directory: str) -> None:
 # ---------------------------------------------------------------------------
 
 class WAL:
-    """Append-only handle with a mutex guarding in-memory state and writes."""
+    """Append-only handle with a mutex guarding in-memory state and writes.
+
+    Batch frames and seal frames share one physical append stream; physical
+    frame ordinals count both kinds.  Seal frames never contribute record
+    sequence numbers.
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -239,11 +380,13 @@ class WAL:
             # health checks and refuse every append/read instead of crash
             # looping and obscuring the corruption.
             self._frames: List[Frame] = []
+            self._seals: List[SealFrame] = []
             self._poisoned = True
             self._poison_reason: Optional[str] = str(exc)
             self.truncated_bytes_on_boot = 0
         else:
             self._frames = list(result.frames)
+            self._seals = list(result.seals)
             self._poisoned = False
             self._poison_reason = None
             self.truncated_bytes_on_boot = result.truncated_bytes
@@ -273,35 +416,102 @@ class WAL:
                 raise PoisonedError(self._poison_reason or "poisoned")
             return list(self._frames)
 
-    # -- mutation ---------------------------------------------------------
-    def append_batch(self, records: List[int]) -> Frame:
-        """Append one fully sealed frame. Caller validates count/range."""
+    def seals_snapshot(self) -> List[SealFrame]:
         with self._lock:
             if self._poisoned:
                 raise PoisonedError(self._poison_reason or "poisoned")
-            frame_no = len(self._frames) + 1
+            return list(self._seals)
+
+    def get_seal(self, seal_id: str) -> Optional[SealFrame]:
+        """Look a committed seal up by its stable id; None if unknown."""
+        with self._lock:
+            if self._poisoned:
+                raise PoisonedError(self._poison_reason or "poisoned")
+            for seal in self._seals:
+                if seal.seal_id == seal_id:
+                    return seal
+            return None
+
+    def prefix_records(self, count: int) -> List[int]:
+        """Return the first ``count`` record doses in sequence order."""
+        with self._lock:
+            if self._poisoned:
+                raise PoisonedError(self._poison_reason or "poisoned")
+            total = self.next_seq - 1
+            if count < 1 or count > total:
+                raise ValueError(
+                    f"sealed count {count} does not match {total} records"
+                )
+            return _records_prefix(self._frames, count)
+
+    # -- mutation ---------------------------------------------------------
+    def _physical_frame_no(self) -> int:
+        return len(self._frames) + len(self._seals) + 1
+
+    def _append_physical(self, frame_bytes: bytes) -> None:
+        """One durable frame write; marks the log poisoned on I/O failure."""
+        try:
+            # One write call per frame; either all of it lands or the tail
+            # is visibly incomplete after a crash.
+            self._fh.write(frame_bytes)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+        except OSError as exc:
+            # A partial write may exist. Mark poisoned rather than risk
+            # appending a second frame over an unknown on-disk state.
+            self._poisoned = True
+            self._poison_reason = f"write failure: {exc}"
+            raise PoisonedError(self._poison_reason) from exc
+        _fsync_dir(os.path.dirname(self.path) or ".")
+
+    def append_batch(self, records: List[int]) -> Frame:
+        """Append one fully sealed batch frame. Caller validates count/range."""
+        with self._lock:
+            if self._poisoned:
+                raise PoisonedError(self._poison_reason or "poisoned")
+            frame_no = self._physical_frame_no()
             seq = (
                 self._frames[-1].seq + len(self._frames[-1].records)
                 if self._frames
                 else 1
             )
             frame_bytes = encode_frame(frame_no, canonical_payload(records))
-            try:
-                # One write call per frame; either all of it lands or the tail
-                # is visibly incomplete after a crash.
-                self._fh.write(frame_bytes)
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
-            except OSError as exc:
-                # A partial write may exist. Mark poisoned rather than risk
-                # appending a second frame over an unknown on-disk state.
-                self._poisoned = True
-                self._poison_reason = f"write failure: {exc}"
-                raise PoisonedError(self._poison_reason) from exc
-            _fsync_dir(os.path.dirname(self.path) or ".")
+            self._append_physical(frame_bytes)
             frame = Frame(frame_no=frame_no, seq=seq, records=list(records))
             self._frames.append(frame)
             return frame
+
+    def append_seal(self, count: int, root: bytes) -> SealFrame:
+        """Persist one seal frame covering the first ``count`` records.
+
+        Caller computes the canonical root of exactly that prefix; recovery
+        will recompute and cross-check it on every subsequent startup.
+        Returns only after the full frame is written and fsynced.
+        """
+        with self._lock:
+            if self._poisoned:
+                raise PoisonedError(self._poison_reason or "poisoned")
+            total = self.next_seq - 1
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise ValueError("count must be an integer")
+            if count < 1 or count > total:
+                raise ValueError(
+                    f"cannot seal {count} records; log contains {total}"
+                )
+            seal_no = len(self._seals) + 1
+            frame_no = self._physical_frame_no()
+            frame_bytes = encode_frame(
+                frame_no, seal_payload(seal_no, count, root)
+            )
+            self._append_physical(frame_bytes)
+            seal = SealFrame(
+                frame_no=frame_no,
+                seal_id=f"s{seal_no}",
+                count=count,
+                root=root.hex(),
+            )
+            self._seals.append(seal)
+            return seal
 
     def close(self) -> None:
         with self._lock:

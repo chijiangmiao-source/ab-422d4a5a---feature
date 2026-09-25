@@ -2,12 +2,15 @@
 """HTTP smoke test against a running ledger instance (LEDGER_BASE_URL).
 
 Posts one small batch at the currently-advertised next sequence and reads it
-back via the cursor API.  Retries briefly on 409 so parallel smoke runs do
-not fail spuriously.  Exits non-zero on any violation.
+back via the cursor API; then seals the current prefix and independently
+folds a membership proof back to the sealed root.  Retries briefly on 409
+so parallel smoke runs do not fail spuriously.  Exits non-zero on any
+violation.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -62,6 +65,40 @@ def main() -> int:
     got = [(r["seq"], r["dose"]) for r in page["records"]]
     assert got == [(next_seq + i, d) for i, d in enumerate(records)], got
     print(f"smoke: read back {got}")
+
+    # Seal the whole prefix at the new head and independently verify a
+    # membership proof for the first record just committed.
+    head = next_seq + len(records)
+    status, seal = call("POST", "/api/seals", {"expected_seq": head})
+    assert status == 201, f"seal: {status} {seal}"
+    assert seal["count"] == head - 1 and seal["next_seq"] == head, seal
+    print(f"smoke: sealed prefix {seal['seal_id']} count={seal['count']} "
+          f"root={seal['root'][:16]}...")
+
+    status, proof = call("GET", f"/api/seals/{seal['seal_id']}/proof"
+                                f"?seq={next_seq}")
+    assert status == 200, proof
+    status, proof_again = call("GET", f"/api/seals/{seal['seal_id']}/proof"
+                                      f"?seq={next_seq}")
+    assert proof == proof_again, "repeated proof query must be identical"
+
+    # Independent recomputation from the wire fields only.
+    current = hashlib.sha256(
+        b"\x00"
+        + json.dumps([proof["seq"], proof["dose"]],
+                     separators=(",", ":")).encode("utf-8")
+    ).digest()
+    for sibling_hex, side in zip(proof["path"], proof["direction"]):
+        sibling = bytes.fromhex(sibling_hex)
+        assert side in ("left", "right"), side
+        if side == "left":
+            current = hashlib.sha256(b"\x01" + current + sibling).digest()
+        else:
+            current = hashlib.sha256(b"\x01" + sibling + current).digest()
+    assert current.hex() == seal["root"], (
+        f"proof folds to {current.hex()}, sealed root {seal['root']}")
+    assert proof["root"] == seal["root"], proof
+    print(f"smoke: proof for seq {next_seq} independently folds to root")
     print("HTTP SMOKE OK")
     return 0
 
