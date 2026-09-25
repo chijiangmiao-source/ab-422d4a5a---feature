@@ -2,12 +2,15 @@
 """HTTP smoke test against a running ledger instance (LEDGER_BASE_URL).
 
 Posts one small batch at the currently-advertised next sequence and reads it
-back via the cursor API.  Retries briefly on 409 so parallel smoke runs do
-not fail spuriously.  Exits non-zero on any violation.
+back via the cursor API. Retries briefly on 409 so parallel smoke runs do
+not fail spuriously. It then seals the confirmed prefix and independently
+folds a returned Merkle inclusion proof back to the sealed root, exercising
+the seal/proof endpoints end to end. Exits non-zero on any violation.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -17,6 +20,8 @@ import urllib.request
 from urllib.parse import urlencode
 
 BASE = os.environ.get("LEDGER_BASE_URL", "http://127.0.0.1:8080")
+LEAF_PREFIX = b"\x00"
+INNER_PREFIX = b"\x01"
 
 
 def call(method: str, path: str, body: object = None) -> tuple[int, dict]:
@@ -62,6 +67,37 @@ def main() -> int:
     got = [(r["seq"], r["dose"]) for r in page["records"]]
     assert got == [(next_seq + i, d) for i, d in enumerate(records)], got
     print(f"smoke: read back {got}")
+
+    # Seal the now-confirmed prefix and verify an inclusion proof purely
+    # from the returned JSON (no service-side trust in the fold).
+    seal_head = next_seq + len(records)
+    status, seal = call("POST", "/api/seals",
+                        {"expected_seq": seal_head})
+    assert status == 201, f"seal: {status} {seal}"
+    # The seal covers the whole confirmed prefix (1..seal_head-1); this run's
+    # batch is its tail, so count is at least what we just committed.
+    assert seal["count"] == seal_head - 1, seal
+    seal_id = seal["seal_id"]
+    print(f"smoke: sealed {seal['count']} records root={seal['root'][:16]}")
+
+    qs = urlencode({"seal_id": seal_id, "seq": next_seq})
+    status, proof = call("GET", f"/api/proofs?{qs}")
+    assert status == 200, proof
+    node = bytes.fromhex(proof["leaf"])
+    assert len(node) == 32
+    for ch, sib_hex in zip(proof["directions"], proof["siblings"]):
+        sibling = bytes.fromhex(sib_hex)
+        if ch == "L":
+            node = hashlib.sha256(INNER_PREFIX + sibling + node).digest()
+        elif ch == "R":
+            node = hashlib.sha256(INNER_PREFIX + node + sibling).digest()
+        else:
+            raise AssertionError(f"bad direction {ch!r}")
+    assert node.hex() == proof["root"] == seal["root"], proof
+    # Repeated query is identical.
+    status, proof_again = call("GET", f"/api/proofs?{qs}")
+    assert status == 200 and proof_again == proof
+    print("smoke: inclusion proof independently folds to sealed root")
     print("HTTP SMOKE OK")
     return 0
 

@@ -7,6 +7,19 @@ POST /api/batches
     201 committed batch / 409 optimistic-concurrency loser (nothing written)
     / 400 malformed / 503 ledger poisoned.
 
+POST /api/seals
+    Body: ``{"expected_seq": <next seq the caller saw>}``
+    Freezes the current confirmed prefix into a citable seal (canonical
+    Merkle root, record count, seal id). Returns only after the seal frame
+    is durably persisted. 409 on a stale sequence, 400 when there is nothing
+    to seal, 503 when poisoned.
+
+GET /api/proofs?seal_id=<hex>&seq=<n>
+    Returns the leaf value, its digest, the sibling path and the left/right
+    directions for record ``seq`` under ``seal_id``. An independent fold of
+    the returned data must reproduce ``root``. 404 for an unknown seal id or
+    a record outside the sealed prefix, 503 when poisoned.
+
 GET /api/records?cursor=<seq>&limit=<n>
     Returns records with serial numbers strictly greater than ``cursor``,
     oldest first, plus ``next_cursor`` for the following page. 503 when
@@ -26,6 +39,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from .ledger import Ledger, MAX_LIMIT, StaleSequence
+from .merkle import Proof, encode_sibling_path
 from .wal import PoisonedError, WAL
 
 MAX_BODY_BYTES = 256 * 1024
@@ -87,20 +101,29 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_health()
         elif parts.path == "/api/records":
             self._handle_records(parts.query)
+        elif parts.path == "/api/proofs":
+            self._handle_proofs(parts.query)
         elif parts.path == "/":
             self._send_json(
                 200,
                 {"service": "dose-ledger", "endpoints": [
-                    "POST /api/batches", "GET /api/records", "GET /healthz"]},
+                    "POST /api/batches", "POST /api/seals",
+                    "GET /api/proofs", "GET /api/records",
+                    "GET /healthz"]},
             )
         else:
             self._send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
         parts = urlsplit(self.path)
-        if parts.path != "/api/batches":
+        if parts.path == "/api/batches":
+            self._handle_batch_post()
+        elif parts.path == "/api/seals":
+            self._handle_seal_post()
+        else:
             self._send_json(404, {"error": "not_found"})
-            return
+
+    def _handle_batch_post(self) -> None:
         body, err = self._read_json_body()
         if err is not None:
             self._send_json(400, {"error": "bad_request", "detail": err})
@@ -155,6 +178,54 @@ class Handler(BaseHTTPRequestHandler):
              "next_seq": frame.seq + len(frame.records)},
         )
 
+    def _handle_seal_post(self) -> None:
+        body, err = self._read_json_body()
+        if err is not None:
+            self._send_json(400, {"error": "bad_request", "detail": err})
+            return
+        assert body is not None
+        expected = body.get("expected_seq")
+        if (
+            isinstance(expected, bool)
+            or not isinstance(expected, int)
+            or expected < 1
+        ):
+            self._send_json(
+                400,
+                {"error": "bad_request",
+                 "detail": "expected_seq must be a positive integer"},
+            )
+            return
+        ledger: Ledger = self.server.ledger  # type: ignore[attr-defined]
+        try:
+            seal = ledger.seal(expected)
+        except StaleSequence as exc:
+            self._send_json(
+                409,
+                {"error": "stale_sequence",
+                 "detail": str(exc),
+                 "current_seq": ledger.head()},
+            )
+            return
+        except ValueError as exc:
+            self._send_json(
+                400, {"error": "bad_request", "detail": str(exc)}
+            )
+            return
+        except PoisonedError as exc:
+            self._send_json(
+                503, {"error": "ledger_poisoned", "detail": str(exc)}
+            )
+            return
+        self._send_json(
+            201,
+            {"status": "sealed",
+             "seal_id": seal.seal_id,
+             "count": seal.count,
+             "root": seal.root.hex(),
+             "seq": seal.seq},
+        )
+
     # -- handlers ---------------------------------------------------------
     def _handle_health(self) -> None:
         ledger: Ledger = self.server.ledger  # type: ignore[attr-defined]
@@ -194,6 +265,69 @@ class Handler(BaseHTTPRequestHandler):
             200,
             {"records": [{"seq": r.seq, "dose": r.dose} for r in page.records],
              "next_cursor": page.next_cursor},
+        )
+
+    def _handle_proofs(self, query: str) -> None:
+        ledger: Ledger = self.server.ledger  # type: ignore[attr-defined]
+        params = parse_qs(query)
+        seal_id = params.get("seal_id", [""])[0]
+        seq_raw = params.get("seq", [""])[0]
+        try:
+            seq = int(seq_raw)
+        except ValueError:
+            self._send_json(
+                400, {"error": "bad_request",
+                      "detail": "seq must be an integer"}
+            )
+            return
+        if not seal_id or seq < 1:
+            self._send_json(
+                400,
+                {"error": "bad_request",
+                 "detail": "seal_id is required and seq must be positive"},
+            )
+            return
+        try:
+            record = ledger.sealed_record(seal_id, seq)
+            proof: Proof = ledger.proof(seal_id, seq)
+        except KeyError:
+            self._send_json(
+                404, {"error": "not_found", "detail": "unknown seal_id"}
+            )
+            return
+        except LookupError as exc:
+            self._send_json(
+                404, {"error": "not_found", "detail": str(exc)}
+            )
+            return
+        except ValueError as exc:
+            self._send_json(
+                400, {"error": "bad_request", "detail": str(exc)}
+            )
+            return
+        except PoisonedError as exc:
+            self._send_json(
+                503, {"error": "ledger_poisoned", "detail": str(exc)}
+            )
+            return
+        directions, siblings = encode_sibling_path(proof.steps)
+        # Sibling digests as a fixed-order list of lowercase hex strings;
+        # directions is one char per bottom-up step, naming the sibling's
+        # side ("L" = sibling is the left child, "R" = right child). Both
+        # orders are fixed, never derived from a dict/memory layout.
+        self._send_json(
+            200,
+            {"seal_id": seal_id,
+             "seq": record.seq,
+             "dose": record.dose,
+             "leaf": proof.leaf.hex(),
+             "count": proof.count,
+             "root": proof.root.hex(),
+             "directions": directions,
+             "siblings": [
+                 siblings[i : i + 32].hex()
+                 for i in range(0, len(siblings), 32)
+             ]},
         )
 
 

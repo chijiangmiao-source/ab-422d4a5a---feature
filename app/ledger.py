@@ -1,11 +1,16 @@
-"""Ledger: serial-number allocation, optimistic concurrency, cursor reads."""
+"""Ledger: serial-number allocation, optimistic concurrency, seals, reads."""
 
 from __future__ import annotations
 
 import threading
-from typing import List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
-from .wal import MAX_RECORDS, MIN_RECORDS, Frame, PoisonedError, WAL
+from .merkle import (
+    Proof,
+    build_proof,
+    merkle_root,
+)
+from .wal import MAX_RECORDS, MIN_RECORDS, Frame, PoisonedError, SealFrame, WAL
 
 # Dose records are plain integers. The protocol statement says "整数剂量
 # 记录" with no stated bound; accept any signed 64-bit-safe JSON integer.
@@ -26,6 +31,15 @@ class Record(NamedTuple):
 class Page(NamedTuple):
     records: List[Record]
     next_cursor: int  # cursor to resume with; equal to last seq when exhausted
+
+
+class Seal(NamedTuple):
+    """Citable summary of a confirmed record prefix."""
+
+    seal_id: str
+    count: int
+    root: bytes
+    seq: int  # next_seq the caller observed when creating the seal point
 
 
 class Ledger:
@@ -97,3 +111,120 @@ class Ledger:
                     return Page(records=out, next_cursor=out[-1].seq)
         next_cursor = out[-1].seq if out else cursor
         return Page(records=out, next_cursor=next_cursor)
+
+    # ------------------------------------------------------------------
+    # Sealing
+    # ------------------------------------------------------------------
+    def _prefix_records(self, frames: List[Frame]
+                        ) -> List[Tuple[int, int]]:
+        """Canonical ``(seq, dose)`` list for every frame, in append order."""
+        out: List[Tuple[int, int]] = []
+        for frame in frames:
+            for i, dose in enumerate(frame.records):
+                out.append((frame.seq + i, dose))
+        return out
+
+    def seal(self, expected_seq: int) -> Seal:
+        """Freeze the prefix currently ending just before ``expected_seq``.
+
+        ``expected_seq`` is the next sequence number the caller observed
+        (1-based head). It must equal the current head and must be at least
+        2, i.e. at least one confirmed record must exist to seal. The Merkle
+        root, record count and seal id are fixed in one seal frame and the
+        call returns only after that frame is durably persisted.
+        """
+        if isinstance(expected_seq, bool) or not isinstance(expected_seq, int):
+            raise ValueError("expected_seq must be an integer")
+        if expected_seq < 2:
+            raise ValueError(
+                "expected_seq must be the head of a non-empty prefix (>= 2)"
+            )
+        with self._lock:
+            if self._wal.poisoned:
+                raise PoisonedError(self._wal.poison_reason or "poisoned")
+            current = self._wal.next_seq
+            if expected_seq != current:
+                raise StaleSequence(f"expected {expected_seq}, actual {current}")
+            records = self._prefix_records(self._wal.snapshot())
+            count = len(records)
+            root = merkle_root(records)
+            # A prefix determines (count, root) and therefore seal_id; sealing
+            # the identical prefix again is idempotent (safe retries / several
+            # auditors observing the same head): return the persisted seal
+            # point without appending a duplicate frame.
+            for existing in self._wal.seals():
+                if existing.count == count:
+                    if existing.root != root:
+                        # Append-only history makes this impossible; treat it
+                        # as corruption rather than serving a mismatched seal.
+                        reason = ("seal idempotency: stored root disagrees "
+                                  "with the recomputed prefix root")
+                        self._wal.poison(reason)
+                        raise PoisonedError(reason)
+                    return Seal(seal_id=existing.seal_id,
+                                count=existing.count,
+                                root=existing.root,
+                                seq=current)
+            self._wal.append_seal(root[:16].hex(), count, root)
+            return Seal(seal_id=root[:16].hex(), count=count, root=root,
+                        seq=current)
+
+    def _seal_index(self) -> Dict[str, SealFrame]:
+        return {s.seal_id: s for s in self._wal.seals()}
+
+    def get_seal(self, seal_id: str) -> SealFrame:
+        """Look up a persisted seal frame by id; KeyError when unknown."""
+        if not isinstance(seal_id, str):
+            raise ValueError("seal_id must be a hex string")
+        return self._seal_index()[seal_id]
+
+    def proof(self, seal_id: str, seq: int) -> Proof:
+        """Return the canonical membership proof of ``seq`` under a seal.
+
+        The proof is rebuilt deterministically from records reconstructed in
+        WAL append order -- never from JSON object iteration order or other
+        transient state. Raises PoisonedError on a poisoned log, KeyError on
+        an unknown seal and LookupError when the record is outside the
+        sealed prefix.
+        """
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            raise ValueError("seq must be a positive integer")
+        with self._lock:
+            if self._wal.poisoned:
+                raise PoisonedError(self._wal.poison_reason or "poisoned")
+            seal = self._seal_index()[seal_id]
+            records = self._prefix_records(self._wal.snapshot())
+            prefix = records[: seal.count]
+            # A proof is only valid against exactly the frozen prefix.
+            if len(prefix) != seal.count:
+                raise PoisonedError(
+                    "sealed prefix is not fully present in the log"
+                )
+            proof = build_proof(prefix, seq)
+            # Independent recomputation must reproduce the persisted root;
+            # refuse to return anything otherwise.
+            if proof.root != seal.root:
+                raise PoisonedError(
+                    "recomputed proof root disagrees with the sealed root"
+                )
+            return proof
+
+    def sealed_record(self, seal_id: str, seq: int) -> Record:
+        """Return the leaf record covered by a seal (value fetch)."""
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            raise ValueError("seq must be a positive integer")
+        with self._lock:
+            if self._wal.poisoned:
+                raise PoisonedError(self._wal.poison_reason or "poisoned")
+            seal = self._seal_index()[seal_id]
+            if seq > seal.count:
+                raise LookupError(
+                    f"seq {seq} is beyond the sealed prefix of {seal.count}"
+                )
+            # Records are numbered 1..count within a prefix.
+            for frame in self._wal.snapshot():
+                last = frame.seq + len(frame.records) - 1
+                if frame.seq <= seq <= last:
+                    return Record(seq=seq,
+                                  dose=frame.records[seq - frame.seq])
+            raise PoisonedError("sealed record missing from the log")

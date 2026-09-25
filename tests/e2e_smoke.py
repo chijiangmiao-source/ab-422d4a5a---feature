@@ -12,7 +12,10 @@ It drives a *real* server subprocess through the full lifecycle:
   5. concurrent preemption over HTTP: N clients submit the same
      ``expected_seq``; exactly one gets 201, all others 409, and the WAL
      grows by exactly one frame -- no loser bytes, no consumed numbers
-  6. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
+  6. seal + Merkle inclusion proof: seal a prefix, independently fold the
+     returned leaf/sibling path back to the returned root over HTTP, prove
+     stability across a restart, and show a tampered seal frame poisons
+  7. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
 
 Exit status is non-zero if any constraint is violated, so a CI/compose
 "verify" service's exit code is the evidence.
@@ -20,6 +23,7 @@ Exit status is non-zero if any constraint is violated, so a CI/compose
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -37,10 +41,28 @@ from app.wal import (  # noqa: E402
     DIGEST_LEN,
     HEADER_LEN,
     canonical_payload,
-    encode_frame,
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+LEAF_PREFIX = b"\x00"
+INNER_PREFIX = b"\x01"
+
+
+def fold_proof(proof: dict) -> str:
+    """Independently recompute a proof root from its JSON leaf/path."""
+    node = bytes.fromhex(proof["leaf"])
+    directions, siblings = proof["directions"], proof["siblings"]
+    assert len(directions) == len(siblings), proof
+    for ch, sib_hex in zip(directions, siblings):
+        sibling = bytes.fromhex(sib_hex)
+        if ch == "L":  # sibling is the left child
+            node = hashlib.sha256(INNER_PREFIX + sibling + node).digest()
+        elif ch == "R":  # sibling is the right child
+            node = hashlib.sha256(INNER_PREFIX + node + sibling).digest()
+        else:
+            raise AssertionError(f"bad proof direction {ch!r}")
+    return node.hex()
 
 
 def request(method: str, url: str, body: object = None,
@@ -272,9 +294,134 @@ def main() -> int:
     finally:
         stop_server(proc)
 
+    section("6. seal + Merkle proof: independent fold, restart, tamper")
+    seal_wal = os.path.join(tmp, "seal.bin")
+    proc, base = start_server(seal_wal)
+    try:
+        # Two batches, five records, sealed at the caller-observed head.
+        request("POST", f"{base}/api/batches",
+                {"expected_seq": 1, "records": [10, 20, 30]})
+        request("POST", f"{base}/api/batches",
+                {"expected_seq": 4, "records": [40, 50]})
+        status, seal = request("POST", f"{base}/api/seals",
+                               {"expected_seq": 6})
+        assert status == 201, seal
+        assert seal["status"] == "sealed", seal
+        assert seal["count"] == 5, seal
+        assert seal["seq"] == 6, seal
+        assert len(seal["root"]) == 64, seal
+        assert set(seal) == {"status", "seal_id", "count", "root", "seq"}
+        assert seal["seal_id"] == seal["root"][:32]
+        seal_id = seal["seal_id"]
+
+        # Every leaf proof independently folds back to the sealed root.
+        roots = set()
+        for seq in range(1, 6):
+            status, proof = request(
+                "GET", f"{base}/api/proofs?seal_id={seal_id}&seq={seq}")
+            assert status == 200, proof
+            assert proof["seq"] == seq
+            assert proof["count"] == 5
+            assert proof["root"] == seal["root"]
+            assert fold_proof(proof) == seal["root"], seq
+            roots.add(proof["root"])
+            # The leaf commits to the canonical record encoding.
+            expect_leaf = hashlib.sha256(
+                LEAF_PREFIX + json.dumps(
+                    {"dose": proof["dose"], "seq": seq},
+                    separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+            assert proof["leaf"] == expect_leaf, seq
+        assert roots == {seal["root"]}
+        print("all 5 proofs independently fold to sealed root",
+              seal["root"][:16])
+
+        # Repeated queries are byte-identical.
+        _, p3 = request(
+            "GET", f"{base}/api/proofs?seal_id={seal_id}&seq=3")
+        _, p3b = request(
+            "GET", f"{base}/api/proofs?seal_id={seal_id}&seq=3")
+        assert p3 == p3b, "repeated seal queries must be identical"
+
+        # A later record is not provable under the older prefix.
+        status, _ = request(
+            "GET", f"{base}/api/proofs?seal_id={seal_id}&seq=6")
+        assert status == 404
+        # An unknown seal id is 404; no proof bytes are returned.
+        status, body = request(
+            "GET", f"{base}/api/proofs?seal_id={'ab' * 16}&seq=1")
+        assert status == 404 and "siblings" not in body, body
+
+        seal_size = os.path.getsize(seal_wal)
+    finally:
+        stop_server(proc)
+
+    # Restart: the seal is rebuilt from the WAL and the root is recomputed
+    # and cross-checked; the same proof is served again.
+    proc, base = start_server(seal_wal)
+    try:
+        _, proof2 = request(
+            "GET", f"{base}/api/proofs?seal_id={seal_id}&seq=2")
+        assert fold_proof(proof2) == seal["root"]
+        print("seal proof survives restart; root re-verified from WAL")
+    finally:
+        stop_server(proc)
+
+    # A complete seal frame whose frame SHA is valid but whose root does not
+    # recompute from the rebuilt prefix must poison the log on restart. Such
+    # a frame is constructed directly (it is impossible to produce via the
+    # API), proving recovery cross-checks roots rather than trusting them.
+    bad_wal = os.path.join(tmp, "badseal.bin")
+    maker = (
+        "import os,sys;"
+        "import app.wal as w;"
+        "from app.merkle import merkle_root;"
+        "p=os.environ['SEAL_WAL'];"
+        "h=w.WAL(p); h.append_batch([1,2]); h.close();"
+        "data=open(p,'rb').read();"
+        "fake=b'\\xab'*32;"
+        "frame=w.encode_frame(2, w.canonical_seal_payload("
+        "fake[:16].hex(), 2, fake), w.MAGIC_SEAL);"
+        "open(p,'wb').write(data+frame)"
+    )
+    made = subprocess.run(
+        [sys.executable, "-c", maker],
+        cwd=REPO_ROOT, env={**os.environ, "SEAL_WAL": bad_wal},
+    )
+    assert made.returncode == 0
+    proc, base = start_server(bad_wal, expect_status=503)
+    try:
+        for path in ("/healthz",
+                     "/api/proofs?seal_id=anything&seq=1",
+                     "/api/records"):
+            status, body = request("GET", f"{base}{path}")
+            assert status == 503, (path, status, body)
+        print("digest-valid seal with mismatched rebuilt root -> poisoned")
+    finally:
+        stop_server(proc)
+
+    # Separately, a flipped payload byte of the real seal frame breaks its
+    # frame digest and must also poison (no proofs or records returned).
+    data = bytearray(open(seal_wal, "rb").read())
+    marker_off = data.rfind(b"DSL1SEAL")
+    assert marker_off >= 0
+    data[marker_off + HEADER_LEN] ^= 0xFF
+    with open(seal_wal, "wb") as fh:
+        fh.write(data)
+    proc, base = start_server(seal_wal, expect_status=503)
+    try:
+        for path in ("/healthz",
+                     f"/api/proofs?seal_id={seal_id}&seq=1",
+                     "/api/records"):
+            status, body = request("GET", f"{base}{path}")
+            assert status == 503, (path, status, body)
+        print("tampered seal frame -> 503, no proof or record returned")
+    finally:
+        stop_server(proc)
+
     external = os.environ.get("LEDGER_BASE_URL")
     if external:
-        section(f"6. external smoke against {external}")
+        section(f"7. external smoke against {external}")
         body = wait_ready(external, expect_status=200)
         status, body = request("POST", f"{external}/api/batches", {
             "expected_seq": body["next_seq"],
