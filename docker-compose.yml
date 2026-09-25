@@ -1,0 +1,42 @@
+services:
+  ledger:
+    build: .
+    image: dose-ledger:latest
+    container_name: dose-ledger
+    environment:
+      LEDGER_HOST: 0.0.0.0
+      LEDGER_PORT: "8080"
+      LEDGER_WAL_PATH: /data/wal.bin
+    ports:
+      # Host port is configurable; override with LEDGER_HOST_PORT, e.g.
+      #   LEDGER_HOST_PORT=18080 docker compose up -d
+      - "${LEDGER_HOST_PORT:-8080}:8080"
+    volumes:
+      - ledger-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
+  verify:
+    build: .
+    image: dose-ledger:latest
+    depends_on:
+      ledger:
+        condition: service_healthy
+    environment:
+      LEDGER_BASE_URL: http://ledger:8080
+    # This one-shot container runs no server; disable the image healthcheck.
+    healthcheck:
+      disable: true
+    # Runs: compile/build check -> unit tests -> lifecycle proof
+    # (torn-tail truncation, corruption isolation, concurrent preemption)
+    # -> HTTP smoke against the ledger service. Exit code is the verdict.
+    entrypoint: ["sh", "scripts/verify.sh"]
+    restart: "no"
+
+volumes:
+  ledger-data:
